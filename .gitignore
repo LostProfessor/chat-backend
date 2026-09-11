@@ -1,0 +1,20 @@
+# ── 构建产物 ──
+bin/
+obj/
+
+# ── IDE / 系统 ──
+.vs/
+.vscode/*
+!.vscode/extensions.json
+*.user
+*.suo
+.DS_Store
+
+# ── 运行时数据（用户上传的媒体文件，不入库） ──
+# 注意：git 规则是「模式含斜杠就锚定到 .gitignore 所在目录」，
+# 而项目在子目录 ChattingWebsite/ 下，所以必须用 **/ 前缀
+**/wwwroot/uploads/
+
+# ── 日志 ──
+logs/
+*.log
