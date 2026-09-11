@@ -49,15 +49,20 @@ public static class WebSocketHandshake
             string token = ParseTokenFromPath(parts[1]);
 
             // ── Step 3: 读取 Sec-WebSocket-Key 头部 ──
+            // ★ 必须一直读到"空行"为止，绝不能找到 Key 就 break！
+            //   否则 Key 之后的其它头部（如 Sec-WebSocket-Extensions）会残留在 TCP 流里，
+            //   接着被 ReceiveFrameAsync 当成 WebSocket 帧去解析 → 帧类型乱码、整条连接报废。
+            //   能不能正常握手完全取决于客户端把 Key 放在第几行 —— 这是典型的"挑客户端"bug。
             string secWebSocketKey = null;
             string line;
             while (!string.IsNullOrEmpty(line = await reader.ReadLineAsync()))
             {
-                if (line.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
-                {
-                    secWebSocketKey = line.Split(':')[1].Trim();
-                    break;
-                }
+                int colon = line.IndexOf(':');
+                if (colon < 0) continue;                       // 忽略非法头行
+                string name = line.Substring(0, colon).Trim();
+                string value = line.Substring(colon + 1).Trim();
+                if (name.Equals("Sec-WebSocket-Key", StringComparison.OrdinalIgnoreCase))
+                    secWebSocketKey = value;
             }
 
             // ── Step 4: 验证 token，提取用户身份 ──

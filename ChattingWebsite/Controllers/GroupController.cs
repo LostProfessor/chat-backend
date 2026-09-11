@@ -412,7 +412,10 @@ namespace ChattingWebsite.Controllers
                     MediaUrl = m.MediaUrl,
                     MediaThumbUrl = m.MediaThumbUrl,
                     MediaName = m.MediaName,
-                    MediaSize = m.MediaSize
+                    MediaSize = m.MediaSize,
+                    // ★ 撤回标记：不返回的话前端刷新后就不知道这条已被撤回，
+                    //   文本会原样复现，媒体消息还会因为磁盘文件已删而变成破图。
+                    IsRecalled = m.IsRecalled
                 });
             }
 

@@ -45,6 +45,8 @@ namespace ChattingWebsite
             builder.Services.AddSingleton<HandlewebSocketsMidWare>();
             builder.Services.AddSingleton<WebSocketServer>();
             builder.Services.AddSingleton<FileTransferSessionManager>();
+            // 媒体后处理器（按 MediaType 分派）：新增文件类型只需加一个实现并注册
+            builder.Services.AddSingleton<IMediaProcessor, ImageProcessor>();
 
             // ── 数据库（SQL Server） ──
             builder.Services.AddDbContext<ChattingWebsiteDBContext>(option =>
