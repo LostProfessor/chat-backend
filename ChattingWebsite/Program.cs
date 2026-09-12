@@ -119,7 +119,30 @@ namespace ChattingWebsite
             // 端口从配置读取（appsettings.json → WebSocket:Port）
             int wsPort = builder.Configuration.GetValue<int>("WebSocket:Port", 5259);
             var wsServer = app.Services.GetRequiredService<WebSocketServer>();
-            _ = Task.Run(() => wsServer.StartAsync(wsPort));
+
+            // ── 启动自检：HTTP 端口与 WebSocket 端口绝不能相同 ──
+            // Windows 的 socket 默认允许地址复用，端口撞车时两个监听器都会“绑定成功”且不报错，
+            // 但连接归谁是不确定的 → WebSocket 握手可能被 HTTP 服务器接走 → 前端反复掉线、
+            // 收不到任何广播。这个故障现象极像“业务 bug”，所以在这里主动拦下来。
+            var httpPorts = app.Urls
+                .Select(u => Uri.TryCreate(u, UriKind.Absolute, out var uri) ? uri.Port : 0)
+                .Where(p => p > 0)
+                .ToList();
+            if (httpPorts.Contains(wsPort))
+            {
+                app.Logger.LogCritical(
+                    "[启动自检] HTTP 端口({HttpPorts}) 与 WebSocket 端口({WsPort}) 冲突！" +
+                    "请修改 appsettings.json 的 WebSocket:Port 或 launchSettings.json 的 applicationUrl。",
+                    string.Join(",", httpPorts), wsPort);
+            }
+
+            // 启动 WS 服务。端口被占用时 StartAsync 会抛异常 —— 这里把失败转成“进程退出”，
+            // 避免出现“HTTP 正常、WebSocket 永远连不上”这种最难排查的中间状态。
+            _ = Task.Run(() => wsServer.StartAsync(wsPort)).ContinueWith(t =>
+            {
+                app.Logger.LogCritical(t.Exception, "[启动自检] WebSocket 服务启动失败，进程退出");
+                Environment.Exit(1);
+            }, TaskContinuationOptions.OnlyOnFaulted);
 
             // ═══════════════ 4. 数据库迁移 + 种子数据 ═══════════════
 

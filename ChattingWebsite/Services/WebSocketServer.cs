@@ -30,7 +30,30 @@ public class WebSocketServer
     public async Task StartAsync(int port)
     {
         var listener = new TcpListener(IPAddress.Any, port);
-        listener.Start();
+
+        // ★ 独占地址：禁止端口复用。
+        // Windows 的 socket 默认允许地址复用，两个进程能同时“绑定成功”同一个端口而不报错，
+        // 结果 HTTP 请求和 WebSocket 连接会被随机分给不同实例 ——
+        // 而 ConnectionManager / FileTransferSessionManager 都是进程内内存，
+        // 广播会静默丢失（撤回、新消息都收不到），极难排查。
+        // 改成独占后，第二个实例会直接招 SocketException 启动失败，一眼可见。
+        if (OperatingSystem.IsWindows())
+            listener.ExclusiveAddressUse = true;
+
+        try
+        {
+            listener.Start();
+        }
+        catch (SocketException ex)
+        {
+            // 端口被占用：致命错误，绝不能静默继续，
+            // 否则会变成“HTTP 正常但 WebSocket 永远连不上”这种最难查的状态
+            _logger.LogCritical(ex,
+                "[自定义WS] 致命错误：端口 {Port} 无法监听（可能已被另一个后端实例占用）。" +
+                "请确认没有第二个后端进程在运行，或修改 appsettings.json 的 WebSocket:Port。", port);
+            throw;
+        }
+
         _logger.LogInformation("[自定义WS] TcpListener 已启动，端口 {Port}", port);
 
         try
