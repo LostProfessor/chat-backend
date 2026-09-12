@@ -82,7 +82,23 @@ namespace ChattingWebsite
             });
 
             // ── JWT 认证 ──
-            var keyBytes = Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Key"]);
+            // 启动自检：签名密钥必须由 user-secrets / 环境变量注入，不写进仓库。
+            // 缺少时直接给出可照做的指引，否则会在 Encoding.GetBytes(null) 处抛出
+            // 难以理解的 ArgumentNullException，让人以为代码坏了。
+            var jwtKey = builder.Configuration["Jwt:Key"];
+            if (string.IsNullOrWhiteSpace(jwtKey) || jwtKey.Length < 32)
+            {
+                Console.Error.WriteLine(
+                    "\n[启动自检] 缺少 Jwt:Key，或长度不足 32 字符（HS256 要求足够长的密钥）。\n" +
+                    "本项目不把密钥提交进仓库，请先在本机注入一次（只需做一次）：\n\n" +
+                    "  cd ChattingWebsite\n" +
+                    "  dotnet user-secrets init\n" +
+                    "  dotnet user-secrets set \"Jwt:Key\" \"<64 位随机字符串>\"\n\n" +
+                    "生成随机串： -join ((1..64) | % { [char](Get-Random -Minimum 48 -Maximum 122) })\n" +
+                    "管理员密码同理： dotnet user-secrets set \"AdminSettings:AdminPassword\" \"<密码>\"\n");
+                Environment.Exit(1);
+            }
+            var keyBytes = Encoding.UTF8.GetBytes(jwtKey);
             builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                 .AddJwtBearer(options =>
                 {
@@ -150,7 +166,7 @@ namespace ChattingWebsite
             {
                 var dbContext = scope.ServiceProvider.GetRequiredService<ChattingWebsiteDBContext>();
                 await dbContext.Database.MigrateAsync();   // 确保表结构最新
-                await DbInitializer.Seed(dbContext);       // 确保必要数据存在
+                await DbInitializer.Seed(dbContext, builder.Configuration);   // 确保必要数据存在
                 Console.WriteLine(dbContext.Database.CanConnect()
                     ? "数据库连接成功！"
                     : "数据库连接异常！请检查数据库连接字符串。");

@@ -1,0 +1,41 @@
+# ═══════════════════════════════════════════════════════════════
+#  行尾统一规则
+#  仓库里一律以 LF 存储（GitHub 友好），检出到 Windows 时自动转 CRLF。
+#  没有这个文件的话，同一个文件在不同机器上会产生「整文件 diff」，
+#  把真正的代码改动淹没掉。
+# ═══════════════════════════════════════════════════════════════
+* text=auto
+
+# Visual Studio / MSBuild 生成的脚本类文件保持 CRLF，避免工具链兼容问题
+*.sln     text eol=crlf
+*.csproj  text eol=crlf
+*.props   text eol=crlf
+*.targets text eol=crlf
+*.ps1     text eol=crlf
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+
+# ── 二进制文件：禁止任何行尾/文本转换 ──
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.bmp  binary
+*.mp4  binary
+*.webm binary
+*.mp3  binary
+*.wav  binary
+*.zip  binary
+*.rar  binary
+*.7z   binary
+*.pdf  binary
+*.dll  binary
+*.pdb  binary
+*.exe  binary
+
+# ── 语言统计修正 ──
+# Migrations 是 EF Core 自动生成的，文件量大且不体现实际工作量，
+# 标记为 generated 后 GitHub 的语言/代码统计会跳过它们。
+ChattingWebsite/Migrations/* linguist-generated=true
