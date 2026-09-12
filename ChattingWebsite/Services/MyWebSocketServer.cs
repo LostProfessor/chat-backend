@@ -24,9 +24,24 @@ public class MyWebSocketServer
     /// </summary>
     private const ulong MaxFramePayload = 1 * 1024 * 1024;
 
+    /// <summary>
+    /// 单条消息（分片累计后）的上限。
+    /// ★ 必须单独卡这个：分片允许把一条消息拆成任意多帧，
+    ///   只限单帧大小的话，客户端可以无限发续帧把内存撑爆。
+    /// </summary>
+    private const int MaxMessageSize = 1 * 1024 * 1024;
+
     private readonly NetworkStream _stream;
     private volatile bool _isOpen = true;
     private int _closeSent;   // 关闭帧只允许发一次（Interlocked：0=未发 1=已发）
+
+    // ────────── 分片消息重组 ──────────
+    // ★ 浏览器会主动分片：实测 Chrome 对超过 64 KB 的消息就会拆帧
+    //   （≤ 65536 B 单帧；≥ 131072 B 分片）。而本项目的文件分块是 256 KB，
+    //   所以「浏览器上传」路径上每一块都会被分片 —— 这不是边缘情况，是主路径。
+    private readonly MemoryStream _fragmentBuffer = new();
+    private Opcode _fragmentOpcode;
+    private bool _fragmenting;
 
     /// <summary>
     /// 写入串行化门。
@@ -113,11 +128,8 @@ public class MyWebSocketServer
         if (isControl && payloadLen > 125)
             throw new WebSocketProtocolException(1002, $"控制帧 {opcode} 的 payload 超过 125 字节");
 
-        // 本项目协议不使用分片：前端走浏览器原生 WebSocket（永远 FIN=1），
-        // 后端 FrameEncoder 也总是以 fin:true 发送。
-        // 因此直接拒绝分片，而不是维护一个永不可达、却又没有长度上限的分片缓冲区。
-        if (!isControl && !fin)
-            throw new WebSocketProtocolException(1002, $"{opcode} 帧使用了分片（FIN=0），本项目协议不支持分片");
+        // 分片帧（FIN=0）是允许的，其合法性靠「分片状态机」校验（见 ReceiveLoopAsync）：
+        // 没有起始帧就来续帧、或分片未完又来新的 Text/Binary，都属协议违规。
 
         // ── 扩展长度 ──
         if (payloadLen == 126)
@@ -166,9 +178,9 @@ public class MyWebSocketServer
         };
     }
 
-    /// <summary>允许的 opcode。故意不含 Continuation(0x0) —— 本项目不支持分片。</summary>
+    /// <summary>允许的 opcode（含 Continuation —— 浏览器会对大消息分片）。</summary>
     private static bool IsKnownOpcode(Opcode opcode) => opcode is
-        Opcode.Text or Opcode.Binary or Opcode.Close or Opcode.Ping or Opcode.Pong;
+        Opcode.Continuation or Opcode.Text or Opcode.Binary or Opcode.Close or Opcode.Ping or Opcode.Pong;
 
     // ═══════════════ 帧发送 ═══════════════
 
@@ -252,15 +264,17 @@ public class MyWebSocketServer
                 switch (frame.Opcode)
                 {
                     case Opcode.Text:
-                        OnTextMessage?.Invoke(this, Encoding.UTF8.GetString(frame.Payload));
+                    case Opcode.Binary:
+                        HandleDataFrame(frame);
                         break;
 
-                    case Opcode.Binary:
-                        OnBinaryMessage?.Invoke(this, frame.Payload);
+                    case Opcode.Continuation:
+                        HandleContinuationFrame(frame);
                         break;
 
                     case Opcode.Ping:
-                        // RFC 6455：收到 Ping 必须回 Pong，payload 原样返回
+                        // RFC 6455：收到 Ping 必须回 Pong，payload 原样返回。
+                        // 控制帧可以出现在分片中间，不得影响重组状态。
                         await SendFrameAsync(frame.Payload, Opcode.Pong);
                         break;
 
@@ -282,9 +296,11 @@ public class MyWebSocketServer
         }
         catch (WebSocketProtocolException ex)
         {
-            // 协议违规：回 Close 并终止连接，绝不继续解析已经不可信的字节流
+            // 协议违规：回 Close 并终止连接，绝不继续解析已经不可信的字节流。
+            // 发完后短暂排空入站数据再关，否则关 TCP 会触发 RST，对端可能收不到关闭帧。
             OnError?.Invoke(this, $"协议错误({ex.CloseCode}) {ex.Message}");
             await SendCloseAsync(ex.CloseCode, ex.Message);
+            await DrainBrieflyAsync();
         }
         catch (Exception ex)
         {
@@ -298,6 +314,91 @@ public class MyWebSocketServer
             // 两边各写一份清理逻辑（这就是重复「已断开」日志的来源）。
             OnClose?.Invoke(this);
         }
+    }
+
+    /// <summary>
+    /// 发完 Close 后短暂地继续读取对端数据，直到对端也关闭或超时。
+    ///
+    /// ★ 为什么必须做：如果直接关闭 TCP，而我们还有未读的入站数据，
+    ///   操作系统会发 RST 而不是 FIN —— 而 RST 会让对端**丢弃已收到但尚未读取的缓冲数据**，
+    ///   于是对端根本看不到我们刚发出的 Close 帧（表现为「莫名 1006 断开、丢失关闭码」）。
+    ///   实测：同样的帧，服务端日志每次都记录了拒绝，但客户端有时能读到 1002、有时读不到。
+    /// </summary>
+    private async Task DrainBrieflyAsync(int timeoutMs = 300)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(timeoutMs);
+            byte[] scratch = new byte[4096];
+            while (!cts.IsCancellationRequested)
+            {
+                int n = await _stream.ReadAsync(scratch, 0, scratch.Length, cts.Token);
+                if (n == 0) break;   // 对端已关闭
+            }
+        }
+        catch { /* 超时/对端重置都无所谓，这里只是尽力而为 */ }
+    }
+
+    // ═══════════════ 分片消息重组 ═══════════════
+    //
+    // 为什么需要这段：浏览器的 WebSocket 会对较大的消息自动拆成多帧
+    //（实测 Chrome：≤64 KB 单帧，超过就分片）。文件分块是 256 KB，
+    // 所以每一块都会以「起始帧(FIN=0) + 若干续帧 + 末续帧(FIN=1)」的形式到达。
+    //
+    // 曾经因为「前端走浏览器原生 WebSocket，永远 FIN=1」这个错误假设
+    // 把这段删掉并改为拒绝分片，结果浏览器上传全部以 Close(1002)
+    // 断开、进度永远 0%，而 Node 手写的单帧测试却全部通过。
+
+    /// <summary>处理 Text/Binary 帧：可能是完整消息，也可能是分片消息的起始帧</summary>
+    private void HandleDataFrame(WebSocketFrame frame)
+    {
+        // 分片进行中又来新的 Text/Binary：无法确定归属，属协议违规
+        if (_fragmenting)
+            throw new WebSocketProtocolException(1002,
+                $"上一条分片消息尚未结束（{_fragmentOpcode}），又收到 {frame.Opcode} 帧");
+
+        if (frame.FIN)
+        {
+            DeliverMessage(frame.Opcode, frame.Payload);
+            return;
+        }
+
+        // 分片起始帧：开始累积，暂不投递
+        _fragmentBuffer.SetLength(0);
+        _fragmentBuffer.Write(frame.Payload, 0, frame.Payload.Length);
+        _fragmentOpcode = frame.Opcode;
+        _fragmenting = true;
+    }
+
+    /// <summary>处理续帧；FIN=1 时组装成完整消息投递</summary>
+    private void HandleContinuationFrame(WebSocketFrame frame)
+    {
+        if (!_fragmenting)
+            throw new WebSocketProtocolException(1002,
+                "收到续帧(Continuation)，但没有正在进行的分片消息");
+
+        _fragmentBuffer.Write(frame.Payload, 0, frame.Payload.Length);
+
+        // ★ 累计上限：分片允许无限多帧，不卡总量就能把内存耗尽
+        if (_fragmentBuffer.Length > MaxMessageSize)
+            throw new WebSocketProtocolException(1009,
+                $"分片消息累计 {_fragmentBuffer.Length} 字节，超过上限 {MaxMessageSize} 字节");
+
+        if (!frame.FIN) return;
+
+        byte[] full = _fragmentBuffer.ToArray();
+        _fragmentBuffer.SetLength(0);
+        _fragmenting = false;
+        DeliverMessage(_fragmentOpcode, full);
+    }
+
+    /// <summary>把一条完整消息交给订阅者</summary>
+    private void DeliverMessage(Opcode opcode, byte[] payload)
+    {
+        if (opcode == Opcode.Text)
+            OnTextMessage?.Invoke(this, Encoding.UTF8.GetString(payload));
+        else
+            OnBinaryMessage?.Invoke(this, payload);
     }
 
     // ═══════════════ 生命周期 ═══════════════
@@ -322,6 +423,7 @@ public class MyWebSocketServer
     {
         _isOpen = false;
         try { _stream?.Close(); } catch { /* 已关闭则忽略 */ }
+        try { _fragmentBuffer.Dispose(); } catch { /* 无所谓 */ }
     }
 }
 
