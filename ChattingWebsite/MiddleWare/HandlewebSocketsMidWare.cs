@@ -31,6 +31,19 @@ public class HandlewebSocketsMidWare
         _connectionManager.AddConnection(userId, nickname, socket);
         _logger.LogInformation("用户 {UserId}({Nickname}) 已连接", userId, nickname);
 
+        // ── 断开清理：必须「恰好一次」 ──
+        // OnClose 事件（正常关闭 / 协议违规 / 对端掉线）与下面的 finally 都会走到这里。
+        // 旧版两边各写一份移除+日志，于是客户端发一个正常的 Close 帧就会刷出两行
+        // 「已断开」（而暴力掉线只有一行）—— 日志行数随断开方式变化，排查时极易误判
+        // 成「同时关掉了两个连接」。用 Interlocked 保证只放行第一个。
+        int cleanedUp = 0;
+        void CleanupOnce()
+        {
+            if (Interlocked.Exchange(ref cleanedUp, 1) != 0) return;
+            _connectionManager.RemoveConnection(userId, socket);
+            _logger.LogInformation("用户 {UserId}({Nickname}) 已断开", userId, nickname);
+        }
+
         // ── 绑定事件 ──
         socket.OnTextMessage += async (ws, json) =>
         {
@@ -58,11 +71,7 @@ public class HandlewebSocketsMidWare
             }
         };
 
-        socket.OnClose += (ws) =>
-        {
-            _connectionManager.RemoveConnection(userId, ws);
-            _logger.LogInformation("用户 {UserId}({Nickname}) 已断开", userId, nickname);
-        };
+        socket.OnClose += (ws) => CleanupOnce();
 
         socket.OnError += (ws, err) =>
         {
@@ -80,8 +89,9 @@ public class HandlewebSocketsMidWare
         }
         finally
         {
-            _connectionManager.RemoveConnection(userId, socket);
-            _logger.LogInformation("用户 {UserId}({Nickname}) 已断开", userId, nickname);
+            // ReceiveLoopAsync 已保证 OnClose 恰好触发一次，这里是兜底
+            // （例如连接还没进入接收循环就抛异常的情况）
+            CleanupOnce();
         }
     }
 
